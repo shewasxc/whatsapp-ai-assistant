@@ -4,3 +4,5 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+qr-code.png
+whatsapp-click-to-chat-qr.png
