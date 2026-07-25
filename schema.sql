@@ -84,6 +84,15 @@ create index if not exists idx_chat_history_user_id on public.chat_history (user
 create index if not exists idx_chat_history_user_created
     on public.chat_history (user_id, created_at desc);
 
+-- WhatsApp gateways (Evolution API/Baileys included) can redeliver the same
+-- webhook event more than once. wa_message_id lets the backend recognize and
+-- skip a message it already processed, so a retry never double-replies or
+-- double-inserts a lead. Only inbound messages carry one; the assistant's own
+-- replies leave it null.
+alter table public.chat_history add column if not exists wa_message_id text;
+create unique index if not exists idx_chat_history_wa_message_id
+    on public.chat_history (wa_message_id) where wa_message_id is not null;
+
 -- =============================================================================
 -- Row Level Security
 -- =============================================================================

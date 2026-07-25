@@ -8,12 +8,16 @@ import main
 client = TestClient(main.app)
 
 
-def _upsert_payload(text="hola", from_me=False, extended=False):
+def _upsert_payload(text="hola", from_me=False, extended=False, message_id="wamid.test123"):
     message = {"extendedTextMessage": {"text": text}} if extended else {"conversation": text}
     return {
         "event": "messages.upsert",
         "data": {
-            "key": {"remoteJid": "34600000000@s.whatsapp.net", "fromMe": from_me},
+            "key": {
+                "remoteJid": "34600000000@s.whatsapp.net",
+                "fromMe": from_me,
+                "id": message_id,
+            },
             "message": message,
             "pushName": "Test User",
         },
@@ -25,12 +29,12 @@ def _upsert_payload(text="hola", from_me=False, extended=False):
 # -----------------------------------------------------------------------------
 def test_extract_incoming_message_conversation_text():
     result = main.extract_incoming_message(_upsert_payload("hola"))
-    assert result == ("34600000000", "hola", "Test User")
+    assert result == ("34600000000", "hola", "Test User", "wamid.test123")
 
 
 def test_extract_incoming_message_extended_text():
     result = main.extract_incoming_message(_upsert_payload("hola", extended=True))
-    assert result == ("34600000000", "hola", "Test User")
+    assert result == ("34600000000", "hola", "Test User", "wamid.test123")
 
 
 def test_extract_incoming_message_ignores_non_upsert_event():
@@ -133,12 +137,25 @@ def test_webhook_ignores_own_outgoing_message():
     assert response.json() == {"status": "ignored"}
 
 
+@patch("main.is_duplicate_message")
+def test_webhook_skips_redelivered_message(mock_is_duplicate):
+    mock_is_duplicate.return_value = True
+
+    response = client.post("/webhook/whatsapp", json=_upsert_payload())
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "duplicate"}
+    mock_is_duplicate.assert_called_once_with("wamid.test123")
+
+
 @patch("main.send_whatsapp_message", new_callable=AsyncMock)
 @patch("main.run_gemini_turn")
 @patch("main.get_recent_history")
 @patch("main.save_chat_message")
 @patch("main.get_or_create_user")
+@patch("main.is_duplicate_message", return_value=False)
 def test_webhook_happy_path(
+    mock_is_duplicate,
     mock_get_or_create_user,
     mock_save_chat_message,
     mock_get_recent_history,
@@ -161,11 +178,62 @@ def test_webhook_happy_path(
         "34600000000", "hola! como puedo ayudarte?"
     )
     assert mock_save_chat_message.call_count == 2
-    mock_save_chat_message.assert_any_call("user-123", "user", "hola")
+    mock_save_chat_message.assert_any_call(
+        "user-123", "user", "hola", wa_message_id="wamid.test123"
+    )
     mock_save_chat_message.assert_any_call("user-123", "assistant", "hola! como puedo ayudarte?")
+
+
+@patch("main.send_whatsapp_message", new_callable=AsyncMock)
+@patch("main.run_gemini_turn")
+@patch("main.get_or_create_user")
+@patch("main.is_duplicate_message", return_value=False)
+def test_webhook_swallows_internal_errors_and_replies_gracefully(
+    mock_is_duplicate,
+    mock_get_or_create_user,
+    mock_run_gemini_turn,
+    mock_send_whatsapp_message,
+):
+    mock_get_or_create_user.side_effect = RuntimeError("supabase is down")
+
+    response = client.post("/webhook/whatsapp", json=_upsert_payload())
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "error"}
+    mock_run_gemini_turn.assert_not_called()
+    mock_send_whatsapp_message.assert_awaited_once_with(
+        "34600000000",
+        "Sorry, I'm having trouble right now — a specialist will follow up shortly.",
+    )
 
 
 def test_health_endpoint():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+# -----------------------------------------------------------------------------
+# GET /leads
+# -----------------------------------------------------------------------------
+def test_leads_requires_admin_key():
+    response = client.get("/leads")
+    assert response.status_code == 401
+
+
+def test_leads_rejects_wrong_admin_key():
+    response = client.get("/leads", headers={"x-admin-key": "wrong"})
+    assert response.status_code == 401
+
+
+@patch("main.list_leads")
+def test_leads_returns_data_with_valid_admin_key(mock_list_leads):
+    mock_list_leads.return_value = [{"id": "lead-1", "budget": 150000, "status": "qualified"}]
+
+    response = client.get(
+        "/leads?status=qualified", headers={"x-admin-key": "test-admin-key"}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"leads": mock_list_leads.return_value}
+    mock_list_leads.assert_called_once_with("qualified")

@@ -3,15 +3,21 @@ WhatsApp AI Assistant — FastAPI backend.
 
 Flow per incoming webhook call:
   1. Evolution API POSTs an inbound WhatsApp message to /webhook/whatsapp.
-  2. We upsert the sender into `users` (Supabase) and log the inbound message
+  2. If we've already logged this wa_message_id, skip — gateways can
+     redeliver the same event, and this keeps that idempotent.
+  3. We upsert the sender into `users` (Supabase) and log the inbound message
      into `chat_history`.
-  3. We load the last 10 messages for that user as conversation context.
-  4. We send that context to Gemini, with a `save_qualified_lead` tool.
-  5. If Gemini decides the user is qualified (has stated a budget), it calls
+  4. We load the last 10 messages for that user as conversation context.
+  5. We send that context to Gemini, with a `save_qualified_lead` tool.
+  6. If Gemini decides the user is qualified (has stated a budget), it calls
      the tool, we write a row into `leads`, and feed the result back to
      Gemini so it can produce a natural-language reply.
-  6. We log Gemini's reply into `chat_history` and send it back to the user
+  7. We log Gemini's reply into `chat_history` and send it back to the user
      via the Evolution API.
+
+Any failure in steps 3-7 is caught, logged, and answered with a graceful
+fallback message rather than a 500 — an error response to the webhook call
+just makes the gateway retry the whole thing.
 """
 
 from __future__ import annotations
@@ -23,7 +29,7 @@ from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, Query, Request, status
 from fastapi.responses import JSONResponse
 from google import genai
 from google.genai import types
@@ -49,8 +55,13 @@ EVOLUTION_API_URL = os.environ["EVOLUTION_API_URL"].rstrip("/")
 EVOLUTION_API_KEY = os.environ["EVOLUTION_API_KEY"]
 EVOLUTION_INSTANCE_NAME = os.environ["EVOLUTION_INSTANCE_NAME"]
 
+# Optional: protects GET /leads. Left unset, the endpoint stays disabled
+# rather than failing the whole app at startup like the required vars above.
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
+
 CHAT_HISTORY_LIMIT = 10
 MAX_TOOL_ITERATIONS = 4  # hard cap so a runaway tool loop can't hang a request
+SEND_RETRY_ATTEMPTS = 2
 
 SYSTEM_PROMPT = """You are a WhatsApp sales assistant for a real estate company.
 Speak naturally and briefly, as a human agent would over WhatsApp — no markdown,
@@ -121,10 +132,27 @@ def get_or_create_user(phone: str, name: str | None) -> dict[str, Any]:
     return created.data[0]
 
 
-def save_chat_message(user_id: str, role: str, text: str) -> None:
-    supabase.table("chat_history").insert(
-        {"user_id": user_id, "role": role, "message_text": text}
-    ).execute()
+def is_duplicate_message(wa_message_id: str) -> bool:
+    """Evolution API can redeliver the same messages.upsert event (e.g. on a
+    reconnect). Checking wa_message_id first means a redelivery never causes
+    a double reply or a double-inserted lead."""
+    existing = (
+        supabase.table("chat_history")
+        .select("id")
+        .eq("wa_message_id", wa_message_id)
+        .limit(1)
+        .execute()
+    )
+    return bool(existing.data)
+
+
+def save_chat_message(
+    user_id: str, role: str, text: str, wa_message_id: str | None = None
+) -> None:
+    row: dict[str, Any] = {"user_id": user_id, "role": role, "message_text": text}
+    if wa_message_id:
+        row["wa_message_id"] = wa_message_id
+    supabase.table("chat_history").insert(row).execute()
 
 
 def get_recent_history(user_id: str, limit: int = CHAT_HISTORY_LIMIT) -> list[dict[str, str]]:
@@ -161,6 +189,18 @@ def save_qualified_lead(user_id: str, budget: float) -> dict[str, Any]:
     return created.data[0]
 
 
+def list_leads(status_filter: str | None, limit: int = 100) -> list[dict[str, Any]]:
+    query = (
+        supabase.table("leads")
+        .select("*, users(phone, name)")
+        .order("created_at", desc=True)
+        .limit(limit)
+    )
+    if status_filter:
+        query = query.eq("status", status_filter)
+    return query.execute().data
+
+
 # -----------------------------------------------------------------------------
 # Evolution API (WhatsApp gateway) helpers
 # -----------------------------------------------------------------------------
@@ -169,17 +209,33 @@ async def send_whatsapp_message(phone: str, text: str) -> None:
     headers = {"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"}
     payload = {"number": phone, "text": text}
 
+    last_error: Exception | None = None
     async with httpx.AsyncClient(timeout=15.0) as client:
-        response = await client.post(url, json=payload, headers=headers)
-        if response.is_error:
-            logger.error(
-                "Evolution API send failed (%s): %s", response.status_code, response.text
-            )
-            response.raise_for_status()
+        for attempt in range(1, SEND_RETRY_ATTEMPTS + 1):
+            try:
+                response = await client.post(url, json=payload, headers=headers)
+                response.raise_for_status()
+                return
+            except httpx.HTTPError as exc:
+                last_error = exc
+                logger.warning(
+                    "Evolution API send attempt %d/%d to %s failed: %s",
+                    attempt,
+                    SEND_RETRY_ATTEMPTS,
+                    phone,
+                    exc,
+                )
+
+    logger.error("Evolution API send to %s failed after retries", phone)
+    assert last_error is not None
+    raise last_error
 
 
-def extract_incoming_message(payload: dict[str, Any]) -> tuple[str, str, str | None] | None:
-    """Pull (phone, text, push_name) out of an Evolution API webhook payload.
+def extract_incoming_message(
+    payload: dict[str, Any],
+) -> tuple[str, str, str | None, str | None] | None:
+    """Pull (phone, text, push_name, wa_message_id) out of an Evolution API
+    webhook payload.
 
     Returns None if this payload isn't an inbound user text message we should
     respond to (e.g. it's our own outbound echo, a status update, or media
@@ -208,7 +264,8 @@ def extract_incoming_message(payload: dict[str, Any]) -> tuple[str, str, str | N
         return None  # media/sticker/reaction with no plain text — skip
 
     push_name = data.get("pushName")
-    return phone, text, push_name
+    wa_message_id = key.get("id")
+    return phone, text, push_name, wa_message_id
 
 
 # -----------------------------------------------------------------------------
@@ -280,21 +337,50 @@ async def whatsapp_webhook(request: Request) -> JSONResponse:
     if extracted is None:
         return JSONResponse({"status": "ignored"}, status_code=status.HTTP_200_OK)
 
-    phone, incoming_text, push_name = extracted
+    phone, incoming_text, push_name, wa_message_id = extracted
 
-    user = get_or_create_user(phone, push_name)
-    user_id = user["id"]
+    if wa_message_id and is_duplicate_message(wa_message_id):
+        logger.info("Skipping duplicate WhatsApp message %s from %s", wa_message_id, phone)
+        return JSONResponse({"status": "duplicate"}, status_code=status.HTTP_200_OK)
 
-    save_chat_message(user_id, "user", incoming_text)
+    try:
+        user = get_or_create_user(phone, push_name)
+        user_id = user["id"]
 
-    history = get_recent_history(user_id, limit=CHAT_HISTORY_LIMIT)
+        save_chat_message(user_id, "user", incoming_text, wa_message_id=wa_message_id)
 
-    reply_text = run_gemini_turn(history, user_id)
+        history = get_recent_history(user_id, limit=CHAT_HISTORY_LIMIT)
+        reply_text = run_gemini_turn(history, user_id)
 
-    save_chat_message(user_id, "assistant", reply_text)
-    await send_whatsapp_message(phone, reply_text)
+        save_chat_message(user_id, "assistant", reply_text)
+        await send_whatsapp_message(phone, reply_text)
+    except Exception:
+        # Never let an internal failure surface as a 5xx to the gateway — that
+        # just triggers a retry storm from Evolution API. Log it for
+        # debugging, best-effort tell the user something's wrong, and move on.
+        logger.exception("Failed to process message from %s", phone)
+        try:
+            await send_whatsapp_message(
+                phone,
+                "Sorry, I'm having trouble right now — a specialist will follow up shortly.",
+            )
+        except Exception:
+            logger.exception("Failed to send fallback message to %s", phone)
+        return JSONResponse({"status": "error"}, status_code=status.HTTP_200_OK)
 
     return JSONResponse({"status": "ok"}, status_code=status.HTTP_200_OK)
+
+
+@app.get("/leads")
+async def get_leads(
+    request: Request, lead_status: str | None = Query(default=None, alias="status")
+) -> JSONResponse:
+    """Simple read endpoint so leads are usable without opening the Supabase
+    dashboard. Protected by a static admin key — disabled if none is set."""
+    if not ADMIN_API_KEY or request.headers.get("x-admin-key") != ADMIN_API_KEY:
+        return JSONResponse({"detail": "unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+
+    return JSONResponse({"leads": list_leads(lead_status)}, status_code=status.HTTP_200_OK)
 
 
 @app.get("/health")
