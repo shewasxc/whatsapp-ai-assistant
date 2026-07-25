@@ -339,11 +339,11 @@ async def whatsapp_webhook(request: Request) -> JSONResponse:
 
     phone, incoming_text, push_name, wa_message_id = extracted
 
-    if wa_message_id and is_duplicate_message(wa_message_id):
-        logger.info("Skipping duplicate WhatsApp message %s from %s", wa_message_id, phone)
-        return JSONResponse({"status": "duplicate"}, status_code=status.HTTP_200_OK)
-
     try:
+        if wa_message_id and is_duplicate_message(wa_message_id):
+            logger.info("Skipping duplicate WhatsApp message %s from %s", wa_message_id, phone)
+            return JSONResponse({"status": "duplicate"}, status_code=status.HTTP_200_OK)
+
         user = get_or_create_user(phone, push_name)
         user_id = user["id"]
 

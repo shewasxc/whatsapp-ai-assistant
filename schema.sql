@@ -109,6 +109,7 @@ alter table public.chat_history enable row level security;
 
 -- Explicit policies for the service_role (redundant with RLS bypass, but
 -- documents intent and keeps the schema self-explanatory).
+drop policy if exists "service_role_full_access_users" on public.users;
 create policy "service_role_full_access_users"
     on public.users
     for all
@@ -116,6 +117,7 @@ create policy "service_role_full_access_users"
     using (true)
     with check (true);
 
+drop policy if exists "service_role_full_access_leads" on public.leads;
 create policy "service_role_full_access_leads"
     on public.leads
     for all
@@ -123,6 +125,7 @@ create policy "service_role_full_access_leads"
     using (true)
     with check (true);
 
+drop policy if exists "service_role_full_access_chat_history" on public.chat_history;
 create policy "service_role_full_access_chat_history"
     on public.chat_history
     for all
