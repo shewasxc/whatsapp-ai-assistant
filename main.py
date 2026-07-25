@@ -41,10 +41,9 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]  # service_role key — bypasses RLS
 
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-# gemini-2.5-flash is the free-tier workhorse: fast, generous free quota,
-# good enough for a chat + tool-calling assistant. Swap to gemini-2.5-pro
-# for higher quality if you outgrow the free tier.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# "gemini-flash-latest" always resolves to Google's current default free-tier
+# flash model, so it keeps working as older pinned versions get retired.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
 
 EVOLUTION_API_URL = os.environ["EVOLUTION_API_URL"].rstrip("/")
 EVOLUTION_API_KEY = os.environ["EVOLUTION_API_KEY"]
